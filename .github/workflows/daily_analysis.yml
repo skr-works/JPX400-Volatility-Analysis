@@ -1,0 +1,32 @@
+name: Daily Stock Analysis
+
+on:
+  schedule:
+    # JST 15:40 = UTC 06:40
+    - cron: '40 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Analysis Script
+        env:
+          # GitHub Secretsを環境変数としてスクリプトに渡す
+          APP_SECRET_AI: ${{ secrets.APP_SECRET_AI }}
+          APP_SECRET_WORDPRESS: ${{ secrets.APP_SECRET_WORDPRESS }}
+        run: python main.py
