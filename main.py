@@ -30,12 +30,12 @@ class Config:
         self.secret_ai = self._load_json_secret("APP_SECRET_AI")
         self.secret_wp = self._load_json_secret("APP_SECRET_WORDPRESS")
         
-        # Gemini設定 (エラーが出ても止まらないようにする)
+        # Gemini設定
         self.ai_enabled = False
         if self.secret_ai and self.secret_ai.get("api_key"):
             try:
                 genai.configure(api_key=self.secret_ai.get("api_key"))
-                self.ai_model_name = self.secret_ai.get("model", "gemini-1.5-flash")
+                self.ai_model_name = self.secret_ai.get("model", "gemini-2.5-flash") # 最新推奨モデル
                 self.ai_enabled = True
             except Exception as e:
                 print(f"[WARNING] Gemini config failed: {e}")
@@ -83,30 +83,43 @@ class MarketData:
                         change_pct = (today_val - prev_val) / prev_val * 100
                         results[name] = {"price": today_val, "change_pct": change_pct}
                 except Exception:
-                    pass # 指数取得失敗は無視して進める
+                    pass
         except Exception as e:
             print(f"[ERROR] Indices fetch failed: {e}")
         return results
 
     @staticmethod
-    def get_jpx400_tickers():
-        """SBI証券からJPX400銘柄リストを取得"""
-        print("[INFO] Fetching JPX400 List...")
+    def get_jpx400_mapping():
+        """SBI証券からJPX400銘柄リスト（コードと名称）を取得"""
+        # 戻り値: {'7203.T': 'トヨタ自動車', ...} の辞書
+        print("[INFO] Fetching JPX400 List & Names...")
         try:
             res = requests.get(MarketData.JPX400_URL, timeout=10)
             res.encoding = "cp932"
             dfs = pd.read_html(res.text)
+            
             target_df = None
             for df in dfs:
-                if df.shape[1] > 0 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
+                # 銘柄コード(数字4桁)が含まれる列を探す
+                if df.shape[1] >= 2 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
                     target_df = df
                     break
-            if target_df is None: target_df = dfs[1]
+            
+            if target_df is None: 
+                # 見つからない場合は2番目のテーブルを仮定
+                target_df = dfs[1]
+
+            # 0列目: コード, 1列目: 銘柄名 と仮定してマッピング作成
             codes = target_df.iloc[:, 0].astype(str).str.zfill(4) + ".T"
-            return codes.tolist()
+            names = target_df.iloc[:, 1].astype(str)
+            
+            # 辞書を作成
+            ticker_map = dict(zip(codes, names))
+            return ticker_map
+            
         except Exception as e:
             print(f"[ERROR] JPX400 list fetch failed: {e}")
-            return []
+            return {}
 
     @staticmethod
     def get_stock_data(tickers):
@@ -114,7 +127,7 @@ class MarketData:
         print(f"[INFO] Fetching stock data for {len(tickers)} tickers...")
         if not tickers: return pd.DataFrame()
         try:
-            # yfinanceのエラーでも止まらないようにする
+            # yfinanceエラー回避
             data = yf.download(tickers, period="120d", interval="1d", group_by="ticker", threads=True, progress=True)
             return data
         except Exception as e:
@@ -128,12 +141,18 @@ class Analyzer:
     """分析ロジックを担当するクラス"""
 
     @staticmethod
-    def analyze_stocks(tickers, data, config):
+    def analyze_stocks(ticker_map, data, config):
+        """
+        ticker_map: {code: name} の辞書
+        """
         results = []
         if data.empty: return []
 
+        tickers = list(ticker_map.keys())
+
         for t in tickers:
             try:
+                # --- データ抽出 ---
                 if isinstance(data.columns, pd.MultiIndex):
                     if t not in data.columns.levels[0]: continue
                     df = data[t].copy()
@@ -144,6 +163,7 @@ class Analyzer:
                 df = df.dropna(subset=["Close", "Volume"])
                 if len(df) < 25: continue
                 
+                # --- テクニカル指標 ---
                 last_close = float(df["Close"].iloc[-1])
                 prev_close = float(df["Close"].iloc[-2])
                 if prev_close == 0: continue
@@ -155,25 +175,42 @@ class Analyzer:
                 vol_avg_20 = df["Volume"].iloc[-22:-2].mean()
                 vol_ratio = vol_today / vol_avg_20 if (vol_avg_20 and vol_avg_20 > 0) else 0
 
+                # --- 判定ロジック ---
+                # 急騰(Plus) or 急落(Minus)
                 is_spike = ret >= config.CHANGE_THRESHOLD
                 is_drop = ret <= -config.CHANGE_THRESHOLD
                 is_active = vol_ratio >= config.VOL_RATIO_THRESHOLD
 
                 if (is_spike or is_drop) and is_active:
+                    # yfinanceから財務情報を取得
                     ticker_info = Analyzer._get_ticker_info(t)
-                    scores, comments = Analyzer._evaluate_fundamentals(ticker_info, ret_pct, vol_ratio)
+                    
+                    # 日本語名を取得 (SBIデータ優先)
+                    jp_name = ticker_map.get(t, ticker_info.get("longName", t))
+
+                    # 6項目スコア計算 (0-10)
+                    scores_dict, total_score = Analyzer._calc_scores(ticker_info, ret_pct)
+                    
+                    # 投資判断 (Buy/Sell/Wait)
+                    judgment = Analyzer._judge_status(total_score, ret_pct)
+
+                    # コメント生成 (Gemini or Logic)
+                    analysis_text = Analyzer._generate_comment(config, t, jp_name, ret_pct, vol_ratio, scores_dict, judgment)
+
                     results.append({
                         "ticker": t,
-                        "name": ticker_info.get("longName", t),
+                        "name": jp_name,
                         "price": last_close,
                         "change_pct": ret_pct,
                         "volume_ratio": vol_ratio,
-                        "scores": scores,
-                        "comments": comments,
-                        "summary": ticker_info.get("longBusinessSummary", "事業概要データなし")
+                        "scores": scores_dict,     # 日本語キーの辞書
+                        "total_score": total_score,
+                        "judgment": judgment,      # 買い検討/売り検討/様子見
+                        "analysis": analysis_text  # Gemini または ロジック生成文
                     })
-                    sleep(0.5)
-            except Exception:
+                    sleep(1.0) # API制限考慮
+            except Exception as e:
+                # 個別エラーは無視
                 continue
         return results
 
@@ -183,102 +220,154 @@ class Analyzer:
         except: return {}
 
     @staticmethod
-    def _evaluate_fundamentals(info, ret_pct, vol_ratio):
-        scores = {}
-        comments = []
+    def _calc_scores(info, ret_pct):
+        """スコア計算 (日本語キーで返す)"""
         def get_val(key, default=None):
             val = info.get(key, default)
             return val if val is not None else default
 
+        # 1. 割安性 (Valuation)
         per = get_val("trailingPE", 100)
         pbr = get_val("priceToBook", 10)
-        score_val = 0
-        if per < 10: score_val += 5
-        elif per < 15: score_val += 3
-        if pbr < 1.0: score_val += 5
-        elif pbr < 1.5: score_val += 3
-        scores["Valuation"] = min(score_val, 10)
-        if score_val >= 8: comments.append("PER/PBR水準から見て、割安感が強い状態です。")
+        s_val = 0
+        if per < 10: s_val += 5
+        elif per < 15: s_val += 3
+        if pbr < 1.0: s_val += 5
+        elif pbr < 1.5: s_val += 3
+        s_val = min(s_val, 10)
 
+        # 2. 収益性 (Profitability)
         roe = get_val("returnOnEquity", 0)
         margin = get_val("operatingMargins", 0)
-        score_prof = 0
-        if roe > 0.15: score_prof += 5
-        elif roe > 0.08: score_prof += 3
-        if margin > 0.10: score_prof += 5
-        elif margin > 0.05: score_prof += 3
-        scores["Profitability"] = min(score_prof, 10)
+        s_prof = 0
+        if roe > 0.15: s_prof += 5
+        elif roe > 0.08: s_prof += 3
+        if margin > 0.10: s_prof += 5
+        elif margin > 0.05: s_prof += 3
+        s_prof = min(s_prof, 10)
 
+        # 3. 財務健全性 (Financial)
         de_ratio = get_val("debtToEquity", 1000)
-        score_fin = 5
-        if de_ratio < 50: score_fin = 10
-        elif de_ratio < 100: score_fin = 7
-        scores["Financial"] = score_fin
+        s_fin = 5
+        if de_ratio < 50: s_fin = 10
+        elif de_ratio < 100: s_fin = 7
 
+        # 4. 成長性 (Growth)
         rev_growth = get_val("revenueGrowth", 0)
-        score_grow = 0
-        if rev_growth > 0.20: score_grow = 10
-        elif rev_growth > 0.10: score_grow = 7
-        elif rev_growth > 0.05: score_grow = 5
-        scores["Growth"] = score_grow
-        if score_grow >= 7: comments.append("直近の売上成長率が高く、事業拡大が続いています。")
+        s_grow = 0
+        if rev_growth > 0.20: s_grow = 10
+        elif rev_growth > 0.10: s_grow = 7
+        elif rev_growth > 0.05: s_grow = 5
 
+        # 5. 配当 (Dividend)
         yield_val = get_val("dividendYield", 0)
-        score_div = 0
-        if yield_val is not None:
-            if yield_val > 0.04: score_div = 10
-            elif yield_val > 0.03: score_div = 7
-            elif yield_val > 0.02: score_div = 5
-        scores["Dividend"] = score_div
-        if score_div >= 7: comments.append(f"配当利回りが{round(yield_val*100, 2)}%と高く、インカムゲインの魅力があります。")
+        s_div = 0
+        if yield_val and yield_val > 0.04: s_div = 10
+        elif yield_val and yield_val > 0.03: s_div = 7
+        elif yield_val and yield_val > 0.02: s_div = 5
 
-        score_mom = 5
-        if abs(ret_pct) > 10: score_mom = 10
-        elif abs(ret_pct) > 6: score_mom = 8
-        scores["Momentum"] = score_mom
+        # 6. モメンタム (Momentum)
+        s_mom = 5
+        if abs(ret_pct) > 10: s_mom = 10
+        elif abs(ret_pct) > 6: s_mom = 8
+
+        scores = {
+            "割安性": s_val,
+            "収益性": s_prof,
+            "財務": s_fin,
+            "成長性": s_grow,
+            "配当": s_div,
+            "モメンタム": s_mom
+        }
+        total = sum(scores.values())
+        return scores, total
+
+    @staticmethod
+    def _judge_status(total_score, ret_pct):
+        """合計スコアと騰落率から判定文を作成"""
+        # 単純なロジック例
+        if total_score >= 40:
+            return "買い検討"
+        elif total_score <= 20:
+            return "売り検討"
+        else:
+            return "様子見"
+
+    @staticmethod
+    def _generate_comment(config, ticker, name, ret_pct, vol_ratio, scores, judgment):
+        """Geminiを使って分析コメントを生成、失敗したらロジックで生成"""
         
-        if ret_pct > 0: comments.append(f"本日は+{round(ret_pct, 2)}%の大幅上昇となりました。")
-        else: comments.append(f"本日は{round(ret_pct, 2)}%の大幅下落となりました。")
-        if vol_ratio > 3.0: comments.append("普段の3倍以上の出来高を伴っており、投資家の注目が集まっています。")
+        # --- Gemini Try ---
+        if config.ai_enabled:
+            try:
+                # プロンプト作成
+                score_str = ", ".join([f"{k}:{v}" for k,v in scores.items()])
+                sign = "+" if ret_pct > 0 else ""
+                
+                prompt = f"""
+                あなたはプロの株式アナリストです。以下の日本株銘柄について、スコアと市況に基づき100文字以内で投資判断のコメントを書いてください。
+                
+                銘柄: {name} ({ticker})
+                本日の変動: {sign}{round(ret_pct, 2)}% (出来高急増: {round(vol_ratio, 1)}倍)
+                あなたの評価スコア(各10点満点): {score_str}
+                総合判断: {judgment}
+                
+                出力要件:
+                - 丁寧語（です・ます）で記述。
+                - 具体的な数値（PERや利回りなど）には触れず、スコアから読み取れる強み・弱みを簡潔に。
+                - 最後に投資家へのアドバイスを一言。
+                """
+                
+                model = genai.GenerativeModel(config.ai_model_name)
+                response = model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                print(f"[WARNING] Individual Stock AI failed: {e}")
+                # 失敗したら下のロジックへフォールバック
 
-        return scores, comments
+        # --- Logic Fallback (定型文) ---
+        comments = []
+        if scores["割安性"] >= 8: comments.append("指標面での割安感が強く、見直し買いの余地があります。")
+        if scores["成長性"] >= 7: comments.append("高い成長性が評価されており、将来性が期待できます。")
+        if scores["配当"] >= 7: comments.append("高配当によるインカムゲインの魅力があります。")
+        
+        if ret_pct > 0:
+            comments.append(f"本日は+{round(ret_pct, 1)}%と大きく上昇しました。")
+        else:
+            comments.append(f"本日は{round(ret_pct, 1)}%と大きく下落しました。")
+            
+        if not comments:
+            comments.append("特段の材料は見当たりませんが、出来高を伴って動意付いています。")
+            
+        return "".join(comments)
 
 # ==========================================
-# 4. AI Writer (Gemini)
+# 4. AI Writer (Market Summary)
 # ==========================================
 class AIWriter:
-    """Gemini APIを使用して概況テキストを生成"""
-    
+    """市場概況用"""
     @staticmethod
     def write_market_summary(indices, config):
-        # AIが無効、またはキーがない場合は定型文
         if not config.ai_enabled:
             return "（※本日の市場概況データは取得できませんでした）"
 
         n225 = indices.get("日経平均", {})
         sp500 = indices.get("S&P500", {})
         
-        # 値がない場合のガード
-        n225_p = n225.get('price', 0)
         n225_c = n225.get('change_pct', 0)
-        sp500_p = sp500.get('price', 0)
         sp500_c = sp500.get('change_pct', 0)
 
         prompt = f"""
-        あなたはベテランの経済記者です。以下の市場データを基に、本日の市場概況を日本語200文字程度で簡潔にまとめてください。
-        客観的な事実を中心に記述してください。
-        [データ]
-        日経平均株価: {round(n225_p)}円 (前日比 {round(n225_c, 2)}%)
-        S&P500: {round(sp500_p)} (前日比 {round(sp500_c, 2)}%)
+        あなたは経済記者です。以下のデータから本日の市場概況を日本語200文字程度で要約してください。
+        日経平均: 前日比 {round(n225_c, 2)}%
+        S&P500: 前日比 {round(sp500_c, 2)}%
         """
-        
         try:
             model = genai.GenerativeModel(config.ai_model_name)
             response = model.generate_content(prompt)
             return response.text.strip()
-        except Exception as e:
-            print(f"[WARNING] AI Generation failed: {e}")
-            return f"本日の日経平均は{round(n225_c, 2)}%、S&P500は{round(sp500_c, 2)}%の動きとなりました。"
+        except Exception:
+            return f"日経平均は{round(n225_c, 2)}%、S&P500は{round(sp500_c, 2)}%の動きとなりました。"
 
 # ==========================================
 # 5. WordPress Publisher
@@ -292,53 +381,52 @@ class WordPressPublisher:
             print("[INFO] WP secret not set. Skip publishing.")
             return
 
-        # --- 重要: URLの自動補正ロジック ---
         base_url = config.secret_wp['url'].rstrip("/")
-        # URLに wp-json が含まれていない場合、自動で付与する
         if "wp-json" not in base_url:
             base_url = f"{base_url}/wp-json/wp/v2"
-        
-        # エンドポイントの構築
         wp_api_url = f"{base_url}/pages/{config.secret_wp['page_id']}"
-        # --------------------------------
 
         today_str = datetime.date.today().strftime("%Y/%m/%d")
         
+        # --- HTML構築 (加飾なし、シンプル構成) ---
         html_parts = []
         html_parts.append(f"<h2>{today_str} 市場概況</h2>")
         html_parts.append(f"<p>{summary_text}</p>")
-        html_parts.append("<hr>")
         
         if not stocks:
             html_parts.append(f"<p><strong>本日は、変動率±{int(config.CHANGE_THRESHOLD*100)}%の基準を超える急騰・急落銘柄はありませんでした。</strong></p>")
-            html_parts.append("<p>市場は比較的落ち着いた動き、または特定の材料難による模様眺めムードの可能性があります。</p>")
         else:
             html_parts.append(f"<h2>本日の注目銘柄（{len(stocks)}件）</h2>")
             for s in stocks:
-                color = "#d32f2f" if s['change_pct'] > 0 else "#1976d2" # 赤/青
+                # 色設定: 急騰=赤, 急落=青
+                color = "#d32f2f" if s['change_pct'] > 0 else "#1976d2"
                 sign = "+" if s['change_pct'] > 0 else ""
                 
-                radar_text = " / ".join([f"{k}:{v}" for k, v in s['scores'].items()])
-                full_comment = "".join(s['comments'])
-                biz_summary = s['summary'][:100] + "..." if len(s['summary']) > 100 else s['summary']
+                # スコア表示用文字列 (例: 割安性:8 成長性:0 ...)
+                score_display = " ".join([f"[{k}:{v}]" for k, v in s['scores'].items()])
+
+                # 判定の色
+                judge_color = "#e65100" # Orange
+                if s['judgment'] == "買い検討": judge_color = "#d32f2f" # Red
+                elif s['judgment'] == "売り検討": judge_color = "#1976d2" # Blue
 
                 section = f"""
-                <div style="border:1px solid #ddd; padding:15px; margin-bottom:20px; border-radius:5px; background-color:#fff;">
-                    <h3 style="margin-top:0; border-bottom:1px solid #eee; padding-bottom:5px;">{s['name']} ({s['ticker']})</h3>
-                    <p style="font-size:1.4em; font-weight:bold; color:{color}; margin:10px 0;">
-                        前日比: {sign}{round(s['change_pct'], 2)}% <span style="font-size:0.7em; color:#333;">(出来高倍率: {round(s['volume_ratio'], 2)}倍)</span>
+                <div style="margin-bottom:30px; padding:15px; border:1px solid #eee;">
+                    <h3>{s['name']} ({s['ticker']})</h3>
+                    <p style="font-size:1.2em;">
+                        <strong style="color:{color};">前日比: {sign}{round(s['change_pct'], 2)}%</strong> 
+                        <span style="font-size:0.8em; color:#555;">(出来高: {round(s['volume_ratio'], 1)}倍)</span>
                     </p>
-                    <div style="background:#f5f5f5; padding:10px; font-size:0.9em; margin-bottom:10px; border-radius:4px;">
-                        <strong>【AIスコア】</strong> {radar_text}
+                    <div style="background:#f9f9f9; padding:10px; margin:10px 0;">
+                        <p style="margin:0; font-weight:bold; color:{judge_color};">判定: {s['judgment']}</p>
+                        <p style="margin:5px 0 0 0; font-size:0.9em; color:#444;">{score_display}</p>
                     </div>
-                    <p style="line-height:1.6;"><strong>【分析】</strong> {full_comment}</p>
-                    <p style="font-size:0.8em; color:#666; margin-top:10px;">{biz_summary}</p>
+                    <p style="line-height:1.6;">{s['analysis']}</p>
                 </div>
                 """
                 html_parts.append(section)
         
-        html_parts.append("<hr>")
-        html_parts.append("<p style='font-size:0.8em; color:#888;'>※本情報はAIおよびプログラムによる自動生成です。投資判断は自己責任でお願いします。</p>")
+        html_parts.append("<p style='font-size:0.8em; color:#888; margin-top:20px;'>※本情報はAIおよびプログラムによる自動生成です。投資判断は自己責任でお願いします。</p>")
         
         final_html = "\n".join(html_parts)
         
@@ -364,8 +452,6 @@ class WordPressPublisher:
         except Exception as e:
             print(f"[ERROR] WordPress update failed: {e}")
             if 'res' in locals():
-                print(f"Response Status: {res.status_code}")
-                # HTMLが返ってきていないか確認（API URLミスの場合はHTMLが返る）
                 if "<html" in res.text[:100]:
                      print("Received HTML instead of JSON. Check your URL.")
                 else:
@@ -387,16 +473,23 @@ def main():
     
     config = Config()
     indices = MarketData.get_indices()
-    jpx_codes = MarketData.get_jpx400_tickers()
     
-    if not jpx_codes:
+    # 銘柄リスト取得 (辞書形式: コード->名称)
+    jpx_map = MarketData.get_jpx400_mapping()
+    
+    if not jpx_map:
         print("[ERROR] No tickers found. Exiting.")
         return
 
-    stock_data = MarketData.get_stock_data(jpx_codes)
-    target_stocks = Analyzer.analyze_stocks(jpx_codes, stock_data, config)
+    # キー（コード）のみリスト化してデータ取得
+    codes = list(jpx_map.keys())
+    stock_data = MarketData.get_stock_data(codes)
+    
+    # 分析実行 (辞書を渡す)
+    target_stocks = Analyzer.analyze_stocks(jpx_map, stock_data, config)
     print(f"[INFO] Found {len(target_stocks)} target stocks.")
     
+    # AI概況
     summary_text = AIWriter.write_market_summary(indices, config)
     print("[INFO] Market summary generated (or skipped).")
     
