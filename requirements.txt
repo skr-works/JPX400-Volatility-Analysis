@@ -1,0 +1,7 @@
+pandas
+yfinance
+requests
+lxml
+html5lib
+google-generativeai
+jpholiday
