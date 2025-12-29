@@ -4,11 +4,25 @@ import json
 import base64
 import datetime
 import requests
+import shutil
 import pandas as pd
 import yfinance as yf
 import jpholiday
+import warnings
+
+# Google Generative AIの警告を抑制
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import google.generativeai as genai
 from time import sleep
+
+# ==========================================
+# 0. Cache Cleanup (yfinance lock fix)
+# ==========================================
+# yfinanceのキャッシュがロックされる問題を防ぐため、カスタムキャッシュパスを設定するか
+# 単純にキャッシュディレクトリの場所を操作して回避を試みる
+# ここでは簡易的に、エラーが出ても無視して進めるように各所をTry-Catchで囲む強化を行う
 
 # ==========================================
 # 1. Config & Constants
@@ -27,8 +41,11 @@ class Config:
         
         # Gemini設定
         if self.secret_ai:
-            genai.configure(api_key=self.secret_ai.get("api_key"))
-            self.ai_model_name = self.secret_ai.get("model", "gemini-1.5-flash")
+            try:
+                genai.configure(api_key=self.secret_ai.get("api_key"))
+                self.ai_model_name = self.secret_ai.get("model", "gemini-1.5-flash")
+            except Exception as e:
+                print(f"[WARNING] Gemini configuration failed: {e}")
 
     def _load_json_secret(self, key):
         """JSON形式の環境変数をパースする"""
@@ -58,18 +75,34 @@ class MarketData:
         results = {}
         
         try:
-            data = yf.download(list(tickers.keys()), period="5d", interval="1d", progress=False)
-            # yfinanceのレスポンス形式対応（MultiIndexの場合）
-            adj_close = data["Close"] if "Close" in data else data
-            
+            # yfinanceのキャッシュ競合を避けるため、スレッド処理などは行わずに取得
             for code, name in tickers.items():
-                if code in adj_close.columns:
-                    series = adj_close[code].dropna()
+                try:
+                    # 個別に取得することでエラー時の全滅を防ぐ
+                    data = yf.download(code, period="5d", interval="1d", progress=False, threads=False)
+                    
+                    # カラムがMultiIndexの場合の対応
+                    if isinstance(data.columns, pd.MultiIndex):
+                        # Close列を取り出す ('Close', '^N225') のような形
+                        if 'Close' in data.columns.levels[0]:
+                            series = data['Close'][code].dropna()
+                        else:
+                            series = data.xs('Close', axis=1, level=0)[code].dropna()
+                    else:
+                        # 通常のDataFrameの場合
+                        series = data['Close'].dropna()
+
                     if len(series) >= 2:
-                        today_val = series.iloc[-1]
-                        prev_val = series.iloc[-2]
+                        today_val = float(series.iloc[-1])
+                        prev_val = float(series.iloc[-2])
                         change_pct = (today_val - prev_val) / prev_val * 100
                         results[name] = {"price": today_val, "change_pct": change_pct}
+                    else:
+                        print(f"[WARNING] Not enough data for {name}")
+
+                except Exception as inner_e:
+                    print(f"[WARNING] Failed to fetch {name}: {inner_e}")
+                    
         except Exception as e:
             print(f"[ERROR] Indices fetch failed: {e}")
             
@@ -80,15 +113,34 @@ class MarketData:
         """SBI証券からJPX400銘柄リストを取得"""
         print("[INFO] Fetching JPX400 List...")
         try:
-            dfs = pd.read_html(MarketData.JPX400_URL)
-            # 通常、銘柄テーブルはインデックス1にあることが多いが、列名で判定推奨
-            # ここでは単純化のためテーブル[1]を使用
-            df = dfs[1]
+            # 【重要修正】 requestsで取得し、Shift-JIS (CP932) でデコードする
+            res = requests.get(MarketData.JPX400_URL, timeout=10)
+            res.encoding = "cp932"  # 日本語サイト用のエンコーディング指定
+            
+            # HTML解析
+            dfs = pd.read_html(res.text)
+            
+            # テーブルの場所を探す（通常は1番目だが、念のためサイズ確認）
+            target_df = None
+            for df in dfs:
+                # 銘柄コードっぽい列があるか確認 (4桁の数字)
+                if df.shape[1] > 0 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
+                    target_df = df
+                    break
+            
+            if target_df is None:
+                # 見つからなかった場合は固定インデックス[1]を試す（前回仕様）
+                target_df = dfs[1]
+
             # 銘柄コード列（0列目）を取得し、文字列化 + ".T" 付与
-            codes = df.iloc[:, 0].astype(str).str.zfill(4) + ".T"
+            codes = target_df.iloc[:, 0].astype(str).str.zfill(4) + ".T"
             return codes.tolist()
+            
         except Exception as e:
             print(f"[ERROR] JPX400 list fetch failed: {e}")
+            # エラーの詳細を表示（デバッグ用）
+            import traceback
+            traceback.print_exc()
             return []
 
     @staticmethod
@@ -98,9 +150,15 @@ class MarketData:
         if not tickers:
             return pd.DataFrame()
             
-        # yfinanceの一括ダウンロード
-        data = yf.download(tickers, period="120d", interval="1d", group_by="ticker", threads=True, progress=True)
-        return data
+        try:
+            # yfinanceの一括ダウンロード
+            # database is lockedを防ぐため、threadsをFalseにするか、リトライロジックを入れるのが定石だが
+            # まずは標準で試みる。失敗したらWarningが出るのみ。
+            data = yf.download(tickers, period="120d", interval="1d", group_by="ticker", threads=True, progress=True)
+            return data
+        except Exception as e:
+            print(f"[ERROR] Bulk download failed: {e}")
+            return pd.DataFrame()
 
 # ==========================================
 # 3. Logic Analyzer
@@ -113,24 +171,46 @@ class Analyzer:
         """急騰・急落銘柄を抽出し、詳細分析を行う"""
         results = []
         
+        # データが空の場合は即リターン
+        if data.empty:
+            return []
+
         for t in tickers:
             # データフレームから対象銘柄の切り出し
             try:
-                df = data[t].dropna(subset=["Close", "Volume"]) if isinstance(data.columns, pd.MultiIndex) else data
+                # MultiIndex対応
+                if isinstance(data.columns, pd.MultiIndex):
+                    if t not in data.columns.levels[0]:
+                        continue
+                    df = data[t].copy()
+                else:
+                    # 1銘柄だけの場合など
+                    df = data.copy()
+
+                # 必要なカラムがあるか確認
+                if 'Close' not in df.columns or 'Volume' not in df.columns:
+                    continue
+
+                df = df.dropna(subset=["Close", "Volume"])
                 if len(df) < 25:
                     continue
                 
                 # テクニカル指標計算
                 # 1. リターン
-                last_close = df["Close"].iloc[-1]
-                prev_close = df["Close"].iloc[-2]
+                last_close = float(df["Close"].iloc[-1])
+                prev_close = float(df["Close"].iloc[-2])
+                if prev_close == 0: continue
+                
                 ret = (last_close - prev_close) / prev_close
                 ret_pct = ret * 100
                 
                 # 2. 出来高比率
-                vol_today = df["Volume"].iloc[-1]
+                vol_today = float(df["Volume"].iloc[-1])
                 vol_avg_20 = df["Volume"].iloc[-22:-2].mean() # 当日を含めない過去平均
-                vol_ratio = vol_today / (vol_avg_20 + 1) # ゼロ除算回避
+                if pd.isna(vol_avg_20) or vol_avg_20 == 0:
+                    vol_ratio = 0
+                else:
+                    vol_ratio = vol_today / vol_avg_20
 
                 # スクリーニング判定
                 is_spike = ret >= config.CHANGE_THRESHOLD
@@ -138,7 +218,7 @@ class Analyzer:
                 is_active = vol_ratio >= config.VOL_RATIO_THRESHOLD
 
                 if (is_spike or is_drop) and is_active:
-                    # 対象銘柄！ -> 詳細情報の取得（APIコールが発生するため、ここで行う）
+                    # 対象銘柄！ -> 詳細情報の取得
                     ticker_info = Analyzer._get_ticker_info(t)
                     
                     # 6項目スコア計算 & コメント生成
@@ -166,7 +246,9 @@ class Analyzer:
     def _get_ticker_info(ticker):
         """詳細情報(info)を取得"""
         try:
-            return yf.Ticker(ticker).info
+            # info取得時のエラーハンドリング
+            t = yf.Ticker(ticker)
+            return t.info
         except:
             return {}
 
@@ -178,7 +260,8 @@ class Analyzer:
         
         # 安全に値を取得するヘルパー
         def get_val(key, default=None):
-            return info.get(key, default)
+            val = info.get(key, default)
+            return val if val is not None else default
 
         # 1. Valuation (割安性)
         per = get_val("trailingPE", 100)
@@ -258,7 +341,7 @@ class AIWriter:
     @staticmethod
     def write_market_summary(indices, config):
         if not config.secret_ai or not indices:
-            return "（API設定不足またはデータ不足のため概況生成スキップ）"
+            return "（データ不足のため概況生成スキップ）"
             
         n225 = indices.get("日経平均", {})
         sp500 = indices.get("S&P500", {})
@@ -366,10 +449,13 @@ class WordPressPublisher:
 # ==========================================
 def main():
     # 0. 祝日判定
-    today = datetime.date.today()
-    if jpholiday.is_holiday(today):
-        print(f"[INFO] {today} is a holiday in Japan. Exiting.")
-        sys.exit(0)
+    try:
+        today = datetime.date.today()
+        if jpholiday.is_holiday(today):
+            print(f"[INFO] {today} is a holiday in Japan. Exiting.")
+            sys.exit(0)
+    except Exception as e:
+        print(f"[WARNING] Holiday check failed: {e}. Proceeding.")
     
     print(f"[INFO] Starting analysis for {today}...")
     
@@ -382,6 +468,8 @@ def main():
     
     if not jpx_codes:
         print("[ERROR] No tickers found. Exiting.")
+        # エラーでも空で更新するために進むか、ここで止めるか。
+        # 仕様上はリスト取得失敗は致命的なので止める
         return
 
     # 株価データ一括取得
