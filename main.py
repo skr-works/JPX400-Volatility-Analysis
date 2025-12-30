@@ -394,7 +394,7 @@ class WordPressPublisher:
         html_parts.append(f"<p>{summary_text}</p>")
         
         if not stocks:
-            html_parts.append(f"<p><strong>本日は、変動率±{int(config.CHANGE_THRESHOLD*100)}%の基準を超える急騰・急落銘柄はありませんでした。</strong></p>")
+            html_parts.append(f"<p><strong>本日は、出来高や変動率±{int(config.CHANGE_THRESHOLD*100)}%などが当サイト基準を超える急騰・急落銘柄はありませんでした。</strong></p>")
         else:
             html_parts.append(f"<h2>本日の注目銘柄（{len(stocks)}件）</h2>")
             for s in stocks:
