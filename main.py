@@ -426,7 +426,7 @@ class WordPressPublisher:
                 """
                 html_parts.append(section)
         
-        html_parts.append("<p style='font-size:0.8em; color:#888; margin-top:20px;'>※本情報はAIおよびプログラムによる自動生成です。投資判断は自己責任でお願いします。</p>")
+        html_parts.append("<p style='font-size:0.8em; color:#888; margin-top:20px;'>※本情報による投資判断は自己責任でお願いします。</p>")
         
         final_html = "\n".join(html_parts)
         
