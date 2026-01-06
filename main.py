@@ -440,7 +440,7 @@ class WordPressPublisher:
         
         payload = {
             "content": final_html,
-            "title": f"【JPX400】本日の急騰・急落銘柄分析 ({today_str})"
+            "title": f"本日の急騰・急落銘柄分析 ({today_str})"
         }
         
         print(f"[INFO] Posting to WordPress API: {wp_api_url}")
