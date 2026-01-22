@@ -25,7 +25,7 @@ class Config:
     CHANGE_THRESHOLD = 0.06  # 騰落率 ±6%
     VOL_RATIO_THRESHOLD = 1.5  # 出来高倍率 1.5倍
     
-    # API制御設定（修正箇所）
+    # API制御設定
     BATCH_SIZE = 5            # 1リクエストでまとめる銘柄数
     MAX_ANALYZE_LIMIT = 20    # AI分析する最大銘柄数（足切りライン）
 
@@ -94,36 +94,56 @@ class MarketData:
 
     @staticmethod
     def get_jpx400_mapping():
-        """SBI証券からJPX400銘柄リスト（コードと名称）を取得"""
-        # 戻り値: {'7203.T': 'トヨタ自動車', ...} の辞書
+        """SBI証券からJPX400銘柄リストを取得（失敗時は主要銘柄をフォールバックとして使用）"""
         print("[INFO] Fetching JPX400 List & Names...")
-        try:
-            res = requests.get(MarketData.JPX400_URL, timeout=10)
-            res.encoding = "cp932"
-            dfs = pd.read_html(res.text)
-            
-            target_df = None
-            for df in dfs:
-                # 銘柄コード(数字4桁)が含まれる列を探す
-                if df.shape[1] >= 2 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
-                    target_df = df
-                    break
-            
-            if target_df is None: 
-                # 見つからない場合は2番目のテーブルを仮定
-                target_df = dfs[1]
+        ticker_map = {}
+        
+        # 対策: ブラウザのふりをするヘッダー
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.sbisec.co.jp/",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
+        }
 
-            # 0列目: コード, 1列目: 銘柄名 と仮定してマッピング作成
-            codes = target_df.iloc[:, 0].astype(str).str.zfill(4) + ".T"
-            names = target_df.iloc[:, 1].astype(str)
+        try:
+            res = requests.get(MarketData.JPX400_URL, headers=headers, timeout=15)
+            res.encoding = "cp932"
             
-            # 辞書を作成
-            ticker_map = dict(zip(codes, names))
-            return ticker_map
-            
+            # HTMLが含まれているかチェック（ブロックされた場合はHTML構造が違うためtryで受ける）
+            try:
+                dfs = pd.read_html(res.text)
+                target_df = None
+                for df in dfs:
+                    # 銘柄コード(数字4桁)が含まれる列を探す
+                    if df.shape[1] >= 2 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
+                        target_df = df
+                        break
+                
+                if target_df is not None:
+                    codes = target_df.iloc[:, 0].astype(str).str.zfill(4) + ".T"
+                    names = target_df.iloc[:, 1].astype(str)
+                    ticker_map = dict(zip(codes, names))
+            except ValueError:
+                print("[WARNING] Could not parse table from response.")
+
         except Exception as e:
-            print(f"[ERROR] JPX400 list fetch failed: {e}")
-            return {}
+            print(f"[WARNING] JPX400 list fetch failed: {e}")
+
+        # 取得失敗、または0件だった場合のフォールバック（エラーで止まらないように主要銘柄を入れる）
+        if not ticker_map:
+            print("[INFO] Using fallback ticker list (Major JP Stocks).")
+            # 代表的な銘柄（TOPIX Core30等の一部）をハードコードで定義
+            fallback_tickers = {
+                "7203.T": "トヨタ自動車", "6758.T": "ソニーG", "8306.T": "三菱UFJ", 
+                "9984.T": "ソフトバンクG", "9983.T": "ファーストリテイリング", "8035.T": "東京エレクトロン",
+                "6861.T": "キーエンス", "9432.T": "NTT", "4063.T": "信越化学", 
+                "6098.T": "リクルート", "4502.T": "武田薬品", "7974.T": "任天堂",
+                "8316.T": "三井住友FG", "8058.T": "三菱商事", "8001.T": "伊藤忠",
+                "6501.T": "日立製作所", "6902.T": "デンソー", "4568.T": "第一三共"
+            }
+            return fallback_tickers
+
+        return ticker_map
 
     @staticmethod
     def get_stock_data(tickers):
@@ -148,7 +168,7 @@ class Analyzer:
     def analyze_stocks(ticker_map, data, config):
         """
         ticker_map: {code: name} の辞書
-        処理フローを修正:
+        処理フロー:
         1. 全銘柄スキャンして候補リストを作成
         2. 候補リストをソートし、上位N件(ハードキャップ)に絞る
         3. 上位N件をバッチ(5件ずつ)でAI処理
