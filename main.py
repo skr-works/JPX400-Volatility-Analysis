@@ -8,6 +8,7 @@ import pandas as pd
 import yfinance as yf
 import jpholiday
 import warnings
+import random  # 追加: ランダム選択用
 from time import sleep
 
 # Google Generative AIの警告を抑制
@@ -98,9 +99,25 @@ class MarketData:
         print("[INFO] Fetching JPX400 List & Names...")
         ticker_map = {}
         
-        # 対策: ブラウザのふりをするヘッダー
+        # 10種類のUser-Agentリスト
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+        ]
+
+        # ランダムにUser-Agentを選択
+        selected_ua = random.choice(user_agents)
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": selected_ua,
             "Referer": "https://www.sbisec.co.jp/",
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
         }
@@ -109,7 +126,7 @@ class MarketData:
             res = requests.get(MarketData.JPX400_URL, headers=headers, timeout=15)
             res.encoding = "cp932"
             
-            # HTMLが含まれているかチェック（ブロックされた場合はHTML構造が違うためtryで受ける）
+            # HTMLが含まれているかチェック
             try:
                 dfs = pd.read_html(res.text)
                 target_df = None
