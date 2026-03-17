@@ -9,10 +9,16 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    # リポジトリへの書き込み権限を追加
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          # コミット履歴を遡れるように fetch-depth: 0 を指定
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
@@ -30,3 +36,20 @@ jobs:
           APP_SECRET_AI: ${{ secrets.APP_SECRET_AI }}
           APP_SECRET_WORDPRESS: ${{ secrets.APP_SECRET_WORDPRESS }}
         run: python main.py
+
+      # 外部アクションを使用せず、シェルスクリプトで60日停止を回避する処理
+      - name: Prevent GitHub Actions suspension
+        run: |
+          last_commit_timestamp=$(git log -1 --format=%ct)
+          current_timestamp=$(date +%s)
+          diff_days=$(( (current_timestamp - last_commit_timestamp) / 86400 ))
+          
+          if [ "$diff_days" -ge 50 ]; then
+            echo "最終コミットから ${diff_days} 日経過しています。停止回避のための空コミットを作成します。"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: prevent GitHub Actions suspension"
+            git push
+          else
+            echo "最終コミットから ${diff_days} 日経過しています。空コミットは不要です。"
+          fi
