@@ -547,7 +547,7 @@ class WordPressPublisher:
         
         if not stocks:
             html_parts.append(
-                f"<p><strong>本日は、出来高推移や変動率±{int(config.CHANGE_THRESHOLD*100)}%が当サイト基準を超える急騰・急落銘柄はありませんでした。</strong></p>"
+                f"<p><strong>本日は、JPX400銘柄で出来高1.5倍と変動率±{int(config.CHANGE_THRESHOLD*100)}%を超える急騰・急落銘柄はありませんでした。</strong></p>"
             )
         else:
             html_parts.append(f"<h2>本日の注目銘柄（{len(stocks)}件）</h2>")
