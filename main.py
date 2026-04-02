@@ -8,7 +8,6 @@ import pandas as pd
 import yfinance as yf
 import jpholiday
 import warnings
-import random  # 追加: ランダム選択用
 from time import sleep
 
 # Google Generative AIの警告を抑制
@@ -62,7 +61,6 @@ class Config:
 # ==========================================
 class MarketData:
     """株価・指数データを取得するクラス"""
-    JPX400_URL = "https://site1.sbisec.co.jp/ETGate/WPLETmgR001Control?OutSide=on&getFlg=on&burl=search_market&cat1=market&cat2=info&dir=info&file=market_meigara_400.html"
 
     @staticmethod
     def get_indices():
@@ -95,70 +93,32 @@ class MarketData:
 
     @staticmethod
     def get_jpx400_mapping():
-        """SBI証券からJPX400銘柄リストを取得（失敗時は主要銘柄をフォールバックとして使用）"""
-        print("[INFO] Fetching JPX400 List & Names...")
+        """data/jpx400_constituents.csv からJPX400銘柄リストを取得"""
+        print("[INFO] Loading JPX400 List & Names from CSV...")
         ticker_map = {}
-        
-        # 10種類のUser-Agentリスト
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
-        ]
-
-        # ランダムにUser-Agentを選択
-        selected_ua = random.choice(user_agents)
-
-        headers = {
-            "User-Agent": selected_ua,
-            "Referer": "https://www.sbisec.co.jp/",
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
-        }
 
         try:
-            res = requests.get(MarketData.JPX400_URL, headers=headers, timeout=15)
-            res.encoding = "cp932"
-            
-            # HTMLが含まれているかチェック
-            try:
-                dfs = pd.read_html(res.text)
-                target_df = None
-                for df in dfs:
-                    # 銘柄コード(数字4桁)が含まれる列を探す
-                    if df.shape[1] >= 2 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
-                        target_df = df
-                        break
-                
-                if target_df is not None:
-                    codes = target_df.iloc[:, 0].astype(str).str.zfill(4) + ".T"
-                    names = target_df.iloc[:, 1].astype(str)
-                    ticker_map = dict(zip(codes, names))
-            except ValueError:
-                print("[WARNING] Could not parse table from response.")
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            csv_path = os.path.join(base_dir, "data", "jpx400_constituents.csv")
+
+            df = pd.read_csv(csv_path, dtype=str).fillna("")
+
+            if "code" not in df.columns or "name" not in df.columns:
+                print(f"[ERROR] Required columns 'code' and 'name' not found in: {csv_path}")
+                return {}
+
+            codes = df["code"].astype(str).str.strip()
+            names = df["name"].astype(str).str.strip()
+
+            ticker_map = {
+                f"{code}.T": name
+                for code, name in zip(codes, names)
+                if code and name
+            }
 
         except Exception as e:
-            print(f"[WARNING] JPX400 list fetch failed: {e}")
-
-        # 取得失敗、または0件だった場合のフォールバック（エラーで止まらないように主要銘柄を入れる）
-        if not ticker_map:
-            print("[INFO] Using fallback ticker list (Major JP Stocks).")
-            # 代表的な銘柄（TOPIX Core30等の一部）をハードコードで定義
-            fallback_tickers = {
-                "7203.T": "トヨタ自動車", "6758.T": "ソニーG", "8306.T": "三菱UFJ", 
-                "9984.T": "ソフトバンクG", "9983.T": "ファーストリテイリング", "8035.T": "東京エレクトロン",
-                "6861.T": "キーエンス", "9432.T": "NTT", "4063.T": "信越化学", 
-                "6098.T": "リクルート", "4502.T": "武田薬品", "7974.T": "任天堂",
-                "8316.T": "三井住友FG", "8058.T": "三菱商事", "8001.T": "伊藤忠",
-                "6501.T": "日立製作所", "6902.T": "デンソー", "4568.T": "第一三共"
-            }
-            return fallback_tickers
+            print(f"[ERROR] JPX400 CSV load failed: {e}")
+            return {}
 
         return ticker_map
 
